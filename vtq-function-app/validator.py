@@ -1,13 +1,11 @@
-# ValidateVtqCsv/validator.py
-
 import csv
 import re
 from dataclasses import dataclass
 from datetime import datetime, date
-from typing import Dict, List, Tuple, Optional, Set, TextIO
+from typing import Dict, List, Tuple, Any, Optional, Set, TextIO
 
 # ---------------------------------------------------------------------------
-# Specification constants
+# Specification constants (from VTQ Entries and Results Specification 2025–26)
 # ---------------------------------------------------------------------------
 
 EXPECTED_COLUMNS: List[str] = [
@@ -47,9 +45,10 @@ EXPECTED_COLUMNS: List[str] = [
     "PartialAbsence",
 ]
 
+# Sentinel “unknown” dates used in the spec
 SENTINEL_DATES = {"2999-12-31", "31/12/2999"}
 
-# Simplified union of UK / BFPO / Irish postcode patterns
+# Postcode patterns (union of UK / BFPO / Irish patterns)
 UK_POSTCODE_RE = r"[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}"
 BFPO_POSTCODE_RE = r"BFPO\s*\d{1,4}"
 IRISH_POSTCODE_RE = r"[AC-FHKNPRTV-Y]\d{1,2}[0-9A-Z]?\s*[0-9AC-FHKNPRTV-Y]{4}"
@@ -80,14 +79,14 @@ QUALIFICATION_TYPE_VALUES = {
 @dataclass
 class FieldSpec:
     name: str
-    mandatory: bool = False
+    mandatory: bool = False           # simple mandatory rule
     allow_minus2: bool = False
     length: Optional[int] = None
     min_length: Optional[int] = None
     max_length: Optional[int] = None
     allowed_values: Optional[Set[str]] = None
     pattern: Optional[str] = None
-    type: Optional[str] = None  # e.g. "date"
+    type: Optional[str] = None        # "date" etc.
 
 
 FIELD_SPECS: Dict[str, FieldSpec] = {
@@ -98,7 +97,7 @@ FIELD_SPECS: Dict[str, FieldSpec] = {
     ),
     "UniqueCandidateIdentifier": FieldSpec(
         name="UniqueCandidateIdentifier",
-        mandatory=False,           # optional individually, group rule enforced elsewhere
+        mandatory=False,           # group rule enforces "at least one identifier"
         allow_minus2=True,
         length=13,
         pattern=r"^[A-Z0-9]{13}$",
@@ -271,17 +270,17 @@ FIELD_SPECS: Dict[str, FieldSpec] = {
     ),
     "FirstEntryDate": FieldSpec(
         name="FirstEntryDate",
-        mandatory=False,  # conditional
+        mandatory=False,      # conditional – record-level rules
         type="date",
     ),
     "AwardDate": FieldSpec(
         name="AwardDate",
-        mandatory=False,  # conditional
+        mandatory=False,      # conditional – record-level rules
         type="date",
     ),
     "QualificationGrade": FieldSpec(
         name="QualificationGrade",
-        mandatory=False,  # conditional
+        mandatory=False,      # conditional – record-level rules
         allow_minus2=True,
         min_length=1,
         max_length=20,
@@ -300,7 +299,7 @@ FIELD_SPECS: Dict[str, FieldSpec] = {
     ),
 }
 
-# Fields where -2 is explicitly allowed by the exclusions doc
+# Fields where -2 is explicitly allowed by the exclusions document
 EXCLUSION_MINUS2_FIELDS = {
     "UKPRN",
     "UniqueCandidateIdentifier",
@@ -354,16 +353,16 @@ def parse_date(value: str) -> Tuple[Optional[date], bool]:
 
 def is_permitted_exclusion(field: str, value: str, error_code: str) -> bool:
     """
-    Exclusions are checked *after* a rule is violated.
+    Apply exclusions AFTER a rule has been violated.
     If this returns True, the error is suppressed.
     """
     v = (value or "").strip()
 
-    # Bullet list of -2 exclusions
+    # -2 exclusions
     if v == "-2" and field in EXCLUSION_MINUS2_FIELDS:
         return True
 
-    # QualificationNumber may contain `/x`
+    # QualificationNumber may contain '/x'
     if field == "QualificationNumber" and "/x" in v:
         return True
 
@@ -391,7 +390,7 @@ def validate_field(field: str, value: str, record_type: str) -> List[Tuple[str, 
     conditional_mandatory = {"FirstEntryDate", "AwardDate", "QualificationGrade"}
 
     if spec:
-        # Simple mandatory check (conditional handled at record level)
+        # Simple mandatory check (conditional ones handled separately)
         if spec.mandatory and field not in conditional_mandatory and is_blank:
             errors.append(("MISSING", "Mandatory field is blank"))
             return errors
@@ -403,7 +402,7 @@ def validate_field(field: str, value: str, record_type: str) -> List[Tuple[str, 
         if v == "-2" and spec.allow_minus2:
             return errors
 
-        # Date handling
+        # Date fields
         if spec.type == "date":
             dt, is_sentinel = parse_date(v)
             if not dt and not is_sentinel:
@@ -413,14 +412,17 @@ def validate_field(field: str, value: str, record_type: str) -> List[Tuple[str, 
             # Range checks for real dates (not sentinel)
             if dt:
                 if dt < date(1900, 1, 1):
-                    errors.append(("DATE_RANGE", f"Date {v!r} must be on or after 1900-01-01"))
+                    errors.append(
+                        ("DATE_RANGE", f"Date {v!r} must be on or after 1900-01-01")
+                    )
 
                 if field == "DOB":
                     today = date.today()
                     age = (today - dt).days / 365.25
                     if age < 5 or age > 80:
                         errors.append(
-                            ("DATE_RANGE", f"Age from DOB {v!r} must be between 5 and 80 years")
+                            ("DATE_RANGE",
+                             f"Age derived from DOB {v!r} must be between 5 and 80 years")
                         )
             return errors
 
@@ -432,20 +434,26 @@ def validate_field(field: str, value: str, record_type: str) -> List[Tuple[str, 
 
         # Pattern
         if spec.pattern and not re.match(spec.pattern, v):
-            errors.append(("PATTERN", f"Value {v!r} does not match pattern {spec.pattern!r}"))
-
-        # Length / min / max length
-        if spec.length is not None and len(v) != spec.length:
-            errors.append(("LENGTH", f"Value {v!r} must be exactly {spec.length} characters"))
-
-        if spec.min_length is not None and len(v) < spec.min_length:
             errors.append(
-                ("MIN_LENGTH", f"Value {v!r} must be at least {spec.min_length} characters")
+                ("PATTERN", f"Value {v!r} does not match pattern {spec.pattern!r}")
             )
 
+        # Exact length
+        if spec.length is not None and len(v) != spec.length:
+            errors.append(
+                ("LENGTH", f"Value {v!r} must be exactly {spec.length} characters long")
+            )
+
+        # Min / max length
+        if spec.min_length is not None and len(v) < spec.min_length:
+            errors.append(
+                ("MIN_LENGTH",
+                 f"Value {v!r} must be at least {spec.min_length} characters long")
+            )
         if spec.max_length is not None and len(v) > spec.max_length:
             errors.append(
-                ("MAX_LENGTH", f"Value {v!r} must be at most {spec.max_length} characters")
+                ("MAX_LENGTH",
+                 f"Value {v!r} must be at most {spec.max_length} characters long")
             )
 
     return errors
@@ -458,7 +466,7 @@ def validate_record_level(row: Dict[str, str], row_number: int) -> List[Validati
     errors: List[ValidationError] = []
     record_type = (row.get("RecordType") or "").strip()
 
-    # At least one learner identifier supplied (per spec notes).
+    # At least one learner identifier supplied
     id_fields = [
         "UniqueCandidateIdentifier",
         "UniqueLearnerNumber",
@@ -471,7 +479,11 @@ def validate_record_level(row: Dict[str, str], row_number: int) -> List[Validati
                 row_number=row_number,
                 field="LearnerIdentifierGroup",
                 error_code="GROUP_RULE",
-                message="At least one learner identifier (UCI/ULN/UPN/Other) must be supplied.",
+                message=(
+                    "At least one learner identifier "
+                    "(UniqueCandidateIdentifier / UniqueLearnerNumber / "
+                    "UniquePupilNumber / CandidateIdentifierOther) must be supplied."
+                ),
                 value="",
             )
         )
@@ -511,7 +523,10 @@ def validate_record_level(row: Dict[str, str], row_number: int) -> List[Validati
                         row_number=row_number,
                         field=fname,
                         error_code="ENTRY_RULE",
-                        message=f"For RecordType=Entry, {fname} must be 2999-12-31 or 31/12/2999.",
+                        message=(
+                            f"For RecordType=Entry, {fname} must be 2999-12-31 "
+                            "or 31/12/2999."
+                        ),
                         value=val,
                     )
                 )
@@ -527,14 +542,17 @@ def validate_record_level(row: Dict[str, str], row_number: int) -> List[Validati
         aw_dt, aw_sent = parse_date(aw_str)
         today = date.today()
 
-        # Sentinel not allowed on those dates here
+        # Sentinel not allowed here
         if fe_sent:
             errors.append(
                 ValidationError(
                     row_number=row_number,
                     field="FirstEntryDate",
                     error_code="SENTINEL_NOT_ALLOWED",
-                    message="FirstEntryDate sentinel allowed only when RecordType=Entry.",
+                    message=(
+                        "FirstEntryDate sentinel (2999-12-31/31/12/2999) is "
+                        "only permitted when RecordType=Entry."
+                    ),
                     value=fe_str,
                 )
             )
@@ -544,7 +562,10 @@ def validate_record_level(row: Dict[str, str], row_number: int) -> List[Validati
                     row_number=row_number,
                     field="AwardDate",
                     error_code="SENTINEL_NOT_ALLOWED",
-                    message="AwardDate sentinel allowed only when RecordType=Entry.",
+                    message=(
+                        "AwardDate sentinel (2999-12-31/31/12/2999) is "
+                        "only permitted when RecordType=Entry."
+                    ),
                     value=aw_str,
                 )
             )
@@ -555,17 +576,24 @@ def validate_record_level(row: Dict[str, str], row_number: int) -> List[Validati
                     row_number=row_number,
                     field="FirstEntryDate",
                     error_code="DATE_FUTURE",
-                    message="FirstEntryDate must not be in the future for Result/Amendment.",
+                    message=(
+                        "FirstEntryDate must not be in the future "
+                        "for Result/Amendment."
+                    ),
                     value=fe_str,
                 )
             )
+
         if aw_dt and aw_dt > today:
             errors.append(
                 ValidationError(
                     row_number=row_number,
                     field="AwardDate",
                     error_code="DATE_FUTURE",
-                    message="AwardDate must not be in the future for Result/Amendment.",
+                    message=(
+                        "AwardDate must not be in the future "
+                        "for Result/Amendment."
+                    ),
                     value=aw_str,
                 )
             )
@@ -612,6 +640,9 @@ def validate_record_level(row: Dict[str, str], row_number: int) -> List[Validati
 # ---------------------------------------------------------------------------
 
 def validate_csv_stream(stream: TextIO) -> List[ValidationError]:
+    """
+    Validate CSV content from an open text stream.
+    """
     errors: List[ValidationError] = []
 
     reader = csv.reader(stream)
@@ -653,20 +684,26 @@ def validate_csv_stream(stream: TextIO) -> List[ValidationError]:
     for row in reader:
         row_idx += 1
 
+        # Skip completely empty physical lines
         if not any(cell.strip() for cell in row):
             continue
 
+        # Column count
         if len(row) != len(EXPECTED_COLUMNS):
             errors.append(
                 ValidationError(
                     row_number=row_idx,
                     field="*ROW*",
                     error_code="COLUMN_COUNT",
-                    message=f"Row must contain {len(EXPECTED_COLUMNS)} columns, found {len(row)}.",
+                    message=(
+                        f"Row must contain {len(EXPECTED_COLUMNS)} columns, "
+                        f"found {len(row)}."
+                    ),
                     value="",
                 )
             )
 
+        # Pad or truncate for safe zipping
         if len(row) < len(EXPECTED_COLUMNS):
             row = row + [""] * (len(EXPECTED_COLUMNS) - len(row))
         elif len(row) > len(EXPECTED_COLUMNS):
@@ -689,7 +726,7 @@ def validate_csv_stream(stream: TextIO) -> List[ValidationError]:
         row_dict = dict(zip(EXPECTED_COLUMNS, row))
         record_type = (row_dict.get("RecordType") or "").strip()
 
-        # Field-level validation
+        # Field-level rules
         for field_name in EXPECTED_COLUMNS:
             val = row_dict.get(field_name, "")
             field_errors = validate_field(field_name, val, record_type)
@@ -706,7 +743,7 @@ def validate_csv_stream(stream: TextIO) -> List[ValidationError]:
                     )
                 )
 
-        # Record-level
+        # Record-level rules
         rec_errors = validate_record_level(row_dict, row_idx)
         errors.extend(rec_errors)
 
@@ -714,6 +751,9 @@ def validate_csv_stream(stream: TextIO) -> List[ValidationError]:
 
 
 def validate_csv_text(csv_text: str) -> List[ValidationError]:
+    """
+    Validate CSV from a text string.
+    """
     from io import StringIO
 
     stream = StringIO(csv_text)
